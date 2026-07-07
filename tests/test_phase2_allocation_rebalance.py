@@ -7,7 +7,8 @@ import pandas as pd
 from quant_assistant.allocation.engine import compute_allocation, STATE_RESET_WARNING, STOP_RESET_MESSAGE
 from quant_assistant.config import ETF_POOL, FX_RATES, STRATEGY_PARAMS
 from quant_assistant.models import Market
-from quant_assistant.rebalance.planner import STALE_BLOCK_MESSAGE, generate_rebalance_plan
+from quant_assistant.rebalance.planner import (QDII_UNKNOWN_PREMIUM_NOTE, STALE_BLOCK_MESSAGE,
+                                               generate_rebalance_plan)
 
 
 @dataclass
@@ -44,6 +45,12 @@ def make_market_data(last_date):
     for idx, code in enumerate(ETF_POOL):
         data[code] = make_daily(last_date, start_price=100.0 + idx, step=0.05 + idx * 0.001)
     return data
+
+
+def set_qdii_premium(df, premium):
+    enriched = df.copy()
+    enriched["单位净值"] = pd.to_numeric(enriched["收盘"], errors="coerce") / (1 + premium)
+    return enriched
 
 
 class Phase2AllocationRebalanceTest(unittest.TestCase):
@@ -245,6 +252,93 @@ class Phase2AllocationRebalanceTest(unittest.TestCase):
         buy_codes = [t["code"] for t in buys]
         self.assertLess(buy_codes.index("511360"), buy_codes.index("510300"))
         self.assertEqual(plan["execution_note"], "执行顺序：先卖出后买入")
+
+    def test_qdii_premium_skips_top_momentum_and_selects_second(self):
+        data = make_market_data(self.as_of)
+        data["513100"] = set_qdii_premium(
+            make_daily(self.as_of, start_price=100.0, step=0.30),
+            0.04,
+        )
+        data["513500"] = set_qdii_premium(
+            make_daily(self.as_of, start_price=100.0, step=0.05),
+            0.0,
+        )
+        allocation = compute_allocation(
+            data,
+            total_assets=100000.0,
+            state={"circuit_breaker_high_water": 100000.0},
+            as_of_date=self.as_of,
+        )
+        self.assertEqual(allocation["signals"]["overseas_selected"], ["513500"])
+        self.assertEqual(allocation["target_weights"]["513100"], 0.0)
+        self.assertAlmostEqual(allocation["target_weights"]["513500"], 0.10)
+
+    def test_qdii_premium_moves_overseas_budget_to_short_bond_when_all_over_limit(self):
+        data = make_market_data(self.as_of)
+        data["513100"] = set_qdii_premium(
+            make_daily(self.as_of, start_price=100.0, step=0.30),
+            0.04,
+        )
+        data["513500"] = set_qdii_premium(
+            make_daily(self.as_of, start_price=100.0, step=0.05),
+            0.05,
+        )
+        allocation = compute_allocation(
+            data,
+            total_assets=100000.0,
+            state={"circuit_breaker_high_water": 100000.0},
+            as_of_date=self.as_of,
+        )
+        self.assertEqual(allocation["signals"]["overseas_selected"], [])
+        self.assertEqual(allocation["target_weights"]["513100"], 0.0)
+        self.assertEqual(allocation["target_weights"]["513500"], 0.0)
+        self.assertGreaterEqual(allocation["target_weights"]["511360"], 0.30)
+
+    def test_qdii_unknown_premium_allows_selection_with_warning(self):
+        data = make_market_data(self.as_of)
+        data["513100"] = make_daily(self.as_of, start_price=100.0, step=0.30)
+        data["513500"] = make_daily(self.as_of, start_price=100.0, step=0.05)
+        allocation = compute_allocation(
+            data,
+            total_assets=100000.0,
+            state={"circuit_breaker_high_water": 100000.0},
+            as_of_date=self.as_of,
+        )
+        self.assertEqual(allocation["signals"]["overseas_selected"], ["513100"])
+        self.assertTrue(any("QDII 溢价未知" in warning for warning in allocation["warnings"]))
+
+    def test_planner_skips_qdii_buy_when_premium_over_limit(self):
+        plan = generate_rebalance_plan(
+            target_weights={"513100": 0.10},
+            positions=[],
+            cash=100000.0,
+            prices={"513100": 1.0},
+            allocation_result={
+                "stale": False,
+                "premium_status": {
+                    "513100": {"premium": 0.04, "status": "over_limit"},
+                },
+            },
+        )
+        self.assertEqual(plan["trades"], [])
+        self.assertEqual(plan["skipped"][0]["code"], "513100")
+        self.assertIn("暂停买入", plan["skipped"][0]["reason"])
+
+    def test_planner_marks_unknown_qdii_premium_buy_for_manual_check(self):
+        plan = generate_rebalance_plan(
+            target_weights={"513100": 0.10},
+            positions=[],
+            cash=100000.0,
+            prices={"513100": 1.0},
+            allocation_result={
+                "stale": False,
+                "premium_status": {
+                    "513100": {"premium": None, "status": "unknown"},
+                },
+            },
+        )
+        self.assertEqual(plan["trades"][0]["code"], "513100")
+        self.assertIn(QDII_UNKNOWN_PREMIUM_NOTE, plan["trades"][0]["reason"])
 
 
 if __name__ == "__main__":

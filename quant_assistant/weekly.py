@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 
 from .allocation import compute_allocation
+from .allocation.engine import RISK_LEGS
 from .backtest.portfolio_engine import PortfolioBacktestConfig, PortfolioBacktestEngine
 from .config import CACHE_DIR, DATA_DIR, ETF_POOL, REPORT_DIR, STRATEGY_PARAMS, TARGET_WEIGHTS
 from .portfolio.holdings import PortfolioManager
@@ -18,6 +19,8 @@ STATE_PATH = DATA_DIR / "state.json"
 HEARTBEAT_WARNING = "周报任务可能已停摆"
 HEARTBEAT_NO_RECORD_NOTICE = "尚无周报运行记录（首次运行或 launchd 未安装）"
 DAILY_CIRCUIT_WARNING = "断路器触发，运行 weekly 获取减仓清单"
+EMERGENCY_REPORT_PREFIX = "emergency"
+EMERGENCY_EXECUTION_NOTE = "应急清单只卖出风险腿，不做买入再平衡；买入归周度清单处理。"
 
 
 def load_state(path: Path = STATE_PATH) -> Optional[dict]:
@@ -154,10 +157,29 @@ def load_etf_market_data() -> Tuple[Dict[str, pd.DataFrame], Dict[str, float], L
         if df.empty:
             warnings.append(f"{code} 缓存为空，按无数据处理")
             continue
+        df = _attach_unit_nav(code, df)
         market_data[code] = df
         if "收盘" in df.columns:
             prices[code] = float(df.sort_values("日期").iloc[-1]["收盘"])
     return market_data, prices, warnings
+
+
+def _attach_unit_nav(code: str, daily_df: pd.DataFrame) -> pd.DataFrame:
+    nav_path = CACHE_DIR / f"{code}_nav.csv"
+    if not nav_path.exists():
+        return daily_df
+    try:
+        nav = pd.read_csv(nav_path, parse_dates=["日期"])
+    except Exception:
+        return daily_df
+    if nav.empty or "单位净值" not in nav.columns:
+        return daily_df
+    clean = daily_df.copy()
+    clean["日期"] = pd.to_datetime(clean["日期"])
+    unit_nav = nav[["日期", "单位净值"]].copy()
+    unit_nav["日期"] = pd.to_datetime(unit_nav["日期"])
+    unit_nav["单位净值"] = pd.to_numeric(unit_nav["单位净值"], errors="coerce")
+    return clean.merge(unit_nav.dropna(subset=["单位净值"]), on="日期", how="left")
 
 
 def check_daily_circuit_breaker(pm: PortfolioManager,
@@ -187,6 +209,143 @@ def check_daily_circuit_breaker(pm: PortfolioManager,
         "high_water": high_water,
         "message": DAILY_CIRCUIT_WARNING,
     }
+
+
+def generate_emergency_rebalance(pm: PortfolioManager,
+                                 as_of_date: Optional[datetime.date] = None,
+                                 state_path: Path = STATE_PATH,
+                                 report_dir: Path = REPORT_DIR,
+                                 params: Optional[dict] = None) -> dict:
+    """日频断路器应急清单。
+
+    与 weekly 共用 compute_allocation 的断路器状态机和 state.json；这里只做卖出，
+    不做买入再平衡。
+    """
+    as_of_date = as_of_date or datetime.date.today()
+    params = params or STRATEGY_PARAMS
+    original_state = load_state(state_path)
+    allocation = compute_allocation(
+        market_data={},
+        total_assets=pm.total_assets,
+        state=original_state,
+        as_of_date=as_of_date,
+        params=params,
+    )
+    action = allocation["drawdown"]["action"]
+    if action not in ("risk_half", "risk_zero"):
+        return {
+            "triggered": False,
+            "allocation": allocation,
+            "trades": [],
+            "report_path": None,
+            "state": original_state,
+        }
+
+    factor = 0.5 if action == "risk_half" else 0.0
+    trades = _emergency_sell_trades(pm, factor, params)
+    report_path = report_dir / f"{EMERGENCY_REPORT_PREFIX}-{as_of_date.isoformat()}.md"
+    markdown = render_emergency_markdown(as_of_date, pm, allocation, trades)
+    report_dir.mkdir(parents=True, exist_ok=True)
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(markdown)
+    new_state = save_state(state_path, original_state, allocation["state_updates"])
+    return {
+        "triggered": True,
+        "allocation": allocation,
+        "trades": trades,
+        "markdown": markdown,
+        "report_path": report_path,
+        "state": new_state,
+    }
+
+
+def _emergency_sell_trades(pm: PortfolioManager, factor: float, params: dict) -> List[dict]:
+    lot_size = int(params.get("lot_size", 100) or 100)
+    min_trade_amount = float(params.get("min_trade_amount", 0.0) or 0.0)
+    trades = []
+    for pos in pm.positions:
+        if pos.code not in RISK_LEGS or pos.shares <= 0 or pos.current_price <= 0:
+            continue
+        sell_shares = int(math.floor((pos.shares * (1 - factor)) / lot_size) * lot_size)
+        if sell_shares <= 0:
+            continue
+        amount = sell_shares * pos.current_price * pos.fx_rate
+        if amount < min_trade_amount:
+            continue
+        action_text = "风险腿清零" if factor == 0.0 else "风险腿减半"
+        trades.append({
+            "category": "应急断路器",
+            "action": "SELL",
+            "code": pos.code,
+            "name": pos.name,
+            "shares": sell_shares,
+            "price": float(pos.current_price),
+            "amount": float(amount),
+            "estimated_fee": _estimate_etf_fee(amount, params),
+            "reason": f"日频断路器触发 {action_text}，只卖出风险腿",
+            "price_date": _position_price_date(pos),
+        })
+    return trades
+
+
+def render_emergency_markdown(as_of_date: datetime.date,
+                              pm: PortfolioManager,
+                              allocation: dict,
+                              trades: List[dict]) -> str:
+    drawdown = allocation["drawdown"]
+    price_dates = sorted({t.get("price_date") for t in trades if t.get("price_date")})
+    price_date_text = "未知" if not price_dates else ", ".join(price_dates)
+    lines = [
+        f"# 应急减仓清单 {as_of_date.isoformat()}",
+        "",
+        f"> {EMERGENCY_EXECUTION_NOTE}",
+        f"> 参考价日期: {price_date_text}",
+        "",
+        "## 触发状态",
+        "",
+        f"- 动作: {drawdown['action']}",
+        f"- 当前净值: ¥{drawdown['current_nav']:,.0f}",
+        f"- 历史高点: ¥{drawdown['high_water']:,.0f}",
+        f"- 当前回撤: {drawdown['drawdown_pct']:.2%}",
+        "",
+        "## 卖出清单",
+        "",
+    ]
+    if not trades:
+        lines.extend(["无可卖出的风险腿持仓。", ""])
+    else:
+        lines.extend([
+            "| 类型 | 方向 | 代码 | 名称 | 份额 | 参考价 | 金额 | 费用估算 | 理由 |",
+            "|---|---|---|---:|---:|---:|---:|---:|---|",
+        ])
+        for trade in trades:
+            lines.append(
+                f"| {trade['category']} | 卖出 | {trade['code']} | {trade['name']} | "
+                f"{trade['shares']:,} | {trade['price']:.4f} | "
+                f"¥{trade['amount']:,.0f} | ¥{trade['estimated_fee']:,.2f} | "
+                f"{trade['reason']} |"
+            )
+        lines.append("")
+    if allocation.get("warnings"):
+        lines.extend(["## 警告", ""])
+        for warning in allocation["warnings"]:
+            lines.append(f"- {warning}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def print_emergency_summary(result: dict) -> None:
+    if not result.get("triggered"):
+        return
+    print("\n  !!! 应急减仓清单已生成 !!!")
+    print(f"  {EMERGENCY_EXECUTION_NOTE}")
+    for trade in result.get("trades", []):
+        print(
+            f"  - 卖出 {trade['code']} {trade['name']} "
+            f"{trade['shares']:,} 份，参考价 {trade['price']:.4f}，"
+            f"金额约 ¥{trade['amount']:,.0f}；{trade['reason']}"
+        )
+    print(f"  Markdown: {result['report_path']}")
 
 
 def update_daily_heartbeat_check(path: Path = STATE_PATH) -> Optional[str]:
@@ -382,8 +541,8 @@ def _signals_section(allocation: dict) -> List[str]:
     lines = [
         "## 各腿信号",
         "",
-        "| 腿 | 代码 | 名称 | 26周动量 | 排名 | 入选 | 说明 |",
-        "|---|---|---:|---:|---:|---:|---|",
+        "| 腿 | 代码 | 名称 | 26周动量 | 溢价 | 排名 | 入选 | 说明 |",
+        "|---|---|---:|---:|---:|---:|---:|---|",
     ]
     rows = []
     for leg_name, title in (("a_share", "A股腿"), ("overseas", "海外腿")):
@@ -392,6 +551,7 @@ def _signals_section(allocation: dict) -> List[str]:
             rows.append(
                 f"| {title} | {row['code']} | {row['name']} | "
                 f"{'-' if momentum is None else format_pct(momentum)} | "
+                f"{format_premium(row)} | "
                 f"{row.get('rank') or '-'} | {'是' if row.get('selected') else '否'} | "
                 f"{row.get('reason', '')} |"
             )
@@ -583,6 +743,24 @@ def _previous_migration_executed(state: Optional[dict], execution_check: dict) -
     return False
 
 
+def _estimate_etf_fee(amount: float, params: dict) -> float:
+    if amount <= 0:
+        return 0.0
+    return round(max(amount * params["commission_rate"], params["min_commission"]), 2)
+
+
+def _position_price_date(pos: object) -> Optional[str]:
+    value = getattr(pos, "last_updated", None)
+    if value is None:
+        return None
+    if hasattr(value, "date"):
+        return value.date().isoformat()
+    try:
+        return datetime.datetime.fromisoformat(str(value)).date().isoformat()
+    except ValueError:
+        return str(value)
+
+
 def _parse_datetime(value: object) -> Optional[datetime.datetime]:
     if not value:
         return None
@@ -594,3 +772,12 @@ def _parse_datetime(value: object) -> Optional[datetime.datetime]:
 
 def format_pct(value: float) -> str:
     return f"{value:.2%}"
+
+
+def format_premium(row: dict) -> str:
+    if row.get("code") not in ("513100", "513500"):
+        return "-"
+    premium = row.get("premium")
+    if premium is None:
+        return "未知"
+    return f"{premium:.2%}"

@@ -84,6 +84,17 @@ python3 -m quant_assistant backtest-portfolio --start 2016-01-01
 | portfolio.json 损坏报错 | `cp data/portfolio.json.bak data/portfolio.json` |
 | 回测报告图表空白 | `data/reports/echarts.min.js` 缺失时会走 CDN；离线则确认该文件存在（源文件在 `quant_assistant/backtest/assets/`） |
 
+## 季度体检
+
+每季度做一次依赖与数据源体检，避免 akshare breaking change 和运行环境腐烂：
+
+1. `.venv/bin/pip install -U akshare`
+2. `.venv/bin/python -m pytest`
+3. `.venv/bin/python -m quant_assistant weekly`，与上期周报关键输出对比
+4. 若异常，回滚到 `requirements.txt` 锁定版本，并在项目记录中注明异常接口、版本和处理方式
+
+Python 3.9 已过官方 EOL；本次不做运行时迁移，下次大版本升级建议迁移到 Python 3.12。
+
 ## 修改代码的约束
 
 - 联网调用只允许出现在 `data/fetcher.py`，其他模块保持离线可用。

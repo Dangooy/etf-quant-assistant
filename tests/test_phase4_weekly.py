@@ -8,6 +8,8 @@ from unittest.mock import patch
 import pandas as pd
 
 from quant_assistant.models import Market
+from quant_assistant.allocation import compute_allocation
+from quant_assistant.config import ETF_POOL
 from quant_assistant.portfolio.holdings import PortfolioManager
 from quant_assistant.weekly import (
     DAILY_CIRCUIT_WARNING,
@@ -17,6 +19,7 @@ from quant_assistant.weekly import (
     _static_50_50_benchmark,
     check_daily_circuit_breaker,
     check_previous_plan_execution,
+    generate_emergency_rebalance,
     generate_weekly_report,
     weekly_heartbeat_warning,
 )
@@ -41,6 +44,21 @@ def position(code, name, shares, price, market="ETF"):
         "sector": "",
         "last_updated": None,
     }
+
+
+def make_weekly_market_data(last_date):
+    data = {}
+    for idx, code in enumerate(ETF_POOL):
+        dates = pd.bdate_range(end=pd.Timestamp(last_date), periods=260)
+        close = [1.0 + idx * 0.01 + i * 0.001 for i in range(len(dates))]
+        data[code] = pd.DataFrame({
+            "日期": dates,
+            "开盘": close,
+            "收盘": close,
+            "最高": close,
+            "最低": close,
+        })
+    return data
 
 
 class Phase4WeeklyTest(unittest.TestCase):
@@ -233,6 +251,110 @@ class Phase4WeeklyTest(unittest.TestCase):
             self.assertIsNotNone(result)
             self.assertEqual(result["message"], DAILY_CIRCUIT_WARNING)
             self.assertEqual(result["level"], "risk_zero")
+
+    def test_emergency_rebalance_zeroes_risk_legs_and_resets_high_water(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            portfolio_path = root / "portfolio.json"
+            state_path = root / "state.json"
+            report_dir = root / "reports"
+            write_portfolio(portfolio_path, [
+                position("510300", "沪深300ETF", 1000, 91.5),
+            ])
+            state_path.write_text(json.dumps({
+                "circuit_breaker_high_water": 100000.0,
+                "events": [],
+            }, ensure_ascii=False), encoding="utf-8")
+            pm = PortfolioManager(portfolio_path)
+            result = generate_emergency_rebalance(
+                pm,
+                as_of_date=datetime.date(2026, 7, 7),
+                state_path=state_path,
+                report_dir=report_dir,
+            )
+            self.assertTrue(result["triggered"])
+            self.assertEqual(result["allocation"]["drawdown"]["action"], "risk_zero")
+            self.assertEqual(result["trades"][0]["shares"], 1000)
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["circuit_breaker_high_water"], 91500.0)
+            self.assertEqual(state["events"][-1]["type"], "circuit_breaker_reset_after_stop")
+            self.assertTrue(result["report_path"].exists())
+
+    def test_emergency_rebalance_halves_risk_legs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            portfolio_path = root / "portfolio.json"
+            state_path = root / "state.json"
+            report_dir = root / "reports"
+            write_portfolio(portfolio_path, [
+                position("510300", "沪深300ETF", 1000, 93.0),
+            ])
+            state_path.write_text(json.dumps({
+                "circuit_breaker_high_water": 100000.0,
+                "events": [],
+            }, ensure_ascii=False), encoding="utf-8")
+            pm = PortfolioManager(portfolio_path)
+            result = generate_emergency_rebalance(
+                pm,
+                as_of_date=datetime.date(2026, 7, 7),
+                state_path=state_path,
+                report_dir=report_dir,
+            )
+            self.assertTrue(result["triggered"])
+            self.assertEqual(result["allocation"]["drawdown"]["action"], "risk_half")
+            self.assertEqual(result["trades"][0]["shares"], 500)
+
+    def test_emergency_rebalance_does_not_trigger_below_warn_level(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            portfolio_path = root / "portfolio.json"
+            state_path = root / "state.json"
+            report_dir = root / "reports"
+            write_portfolio(portfolio_path, [
+                position("510300", "沪深300ETF", 1000, 95.0),
+            ])
+            state_path.write_text(json.dumps({
+                "circuit_breaker_high_water": 100000.0,
+                "events": [],
+            }, ensure_ascii=False), encoding="utf-8")
+            pm = PortfolioManager(portfolio_path)
+            result = generate_emergency_rebalance(
+                pm,
+                as_of_date=datetime.date(2026, 7, 7),
+                state_path=state_path,
+                report_dir=report_dir,
+            )
+            self.assertFalse(result["triggered"])
+            self.assertFalse(report_dir.exists())
+
+    def test_daily_emergency_state_prevents_weekly_duplicate_stop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            portfolio_path = root / "portfolio.json"
+            state_path = root / "state.json"
+            report_dir = root / "reports"
+            write_portfolio(portfolio_path, [
+                position("510300", "沪深300ETF", 1000, 91.5),
+            ])
+            state_path.write_text(json.dumps({
+                "circuit_breaker_high_water": 100000.0,
+                "events": [],
+            }, ensure_ascii=False), encoding="utf-8")
+            pm = PortfolioManager(portfolio_path)
+            generate_emergency_rebalance(
+                pm,
+                as_of_date=datetime.date(2026, 7, 7),
+                state_path=state_path,
+                report_dir=report_dir,
+            )
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            weekly = compute_allocation(
+                make_weekly_market_data(datetime.date(2026, 7, 7)),
+                total_assets=91800.0,
+                state=state,
+                as_of_date=datetime.date(2026, 7, 7),
+            )
+            self.assertEqual(weekly["drawdown"]["action"], "none")
 
 
 if __name__ == "__main__":

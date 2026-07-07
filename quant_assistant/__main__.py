@@ -47,8 +47,8 @@ def cmd_daily(args):
     from .portfolio.suggestions import generate_suggestions
     from .pipeline import run_daily_pipeline
     from .dashboard import generate_dashboard
-    from .weekly import (HEARTBEAT_NO_RECORD_NOTICE, check_daily_circuit_breaker,
-                         update_daily_heartbeat_check)
+    from .weekly import (HEARTBEAT_NO_RECORD_NOTICE, generate_emergency_rebalance,
+                         print_emergency_summary, update_daily_heartbeat_check)
 
     pm = PortfolioManager()
     if not pm.positions:
@@ -61,10 +61,12 @@ def cmd_daily(args):
         print(f"\n  [{label}] {heartbeat_warning}")
 
     result = run_daily_pipeline(pm, days=args.days)
-    circuit_warning = check_daily_circuit_breaker(pm)
-    if circuit_warning:
+    emergency = generate_emergency_rebalance(pm)
+    circuit_warning = emergency["allocation"]["drawdown"] if emergency.get("triggered") else None
+    if emergency.get("triggered"):
         print("\n  !!! 断路器日频监控告警 !!!")
-        print(f"  {circuit_warning['message']}（当前回撤 {circuit_warning['drawdown_pct']:.2%}）")
+        print(f"  当前回撤 {circuit_warning['drawdown_pct']:.2%}，动作 {circuit_warning['action']}")
+        print_emergency_summary(emergency)
 
     result["analyzer"].print_dashboard()
 
@@ -83,9 +85,9 @@ def cmd_daily(args):
         print(f"\n  ⚠ 以下标的行情获取失败（用旧价格计算）: {', '.join(result['fetch_errors'])}")
 
     dashboard_alerts = []
-    if circuit_warning:
+    if emergency.get("triggered"):
         dashboard_alerts.append(
-            f"{circuit_warning['message']}（当前回撤 {circuit_warning['drawdown_pct']:.2%}）"
+            f"断路器日频应急已触发（当前回撤 {circuit_warning['drawdown_pct']:.2%}，动作 {circuit_warning['action']}）"
         )
     path = generate_dashboard(pm, stock_data=result["stock_data"],
                               top_alerts=dashboard_alerts)

@@ -208,8 +208,8 @@ class DataFetcher:
     def fetch_nav(self, code: str, start_date, offline: bool = False) -> Optional[pd.DataFrame]:
         """拉取 ETF 累计净值，缓存为 {code}_nav.csv。
 
-        数据源为天天基金历史净值明细，返回列统一为 日期/累计净值。联网只在
-        本方法内发生；失败时降级为旧缓存。
+        数据源为天天基金历史净值明细，返回列统一为 日期/累计净值/单位净值
+        （旧缓存可能缺单位净值）。联网只在本方法内发生；失败时降级为旧缓存。
         """
         if isinstance(start_date, str):
             want_start = datetime.datetime.strptime(start_date, "%Y-%m-%d").date()
@@ -221,7 +221,11 @@ class DataFetcher:
         if cached is not None:
             cache_last = cached["日期"].max().date()
             cache_first = cached["日期"].min().date()
-            if offline or (cache_last >= self._last_completed_trading_day() and cache_first <= want_start):
+            has_unit_nav = "单位净值" in cached.columns
+            if offline or (
+                has_unit_nav and cache_last >= self._last_completed_trading_day()
+                and cache_first <= want_start
+            ):
                 return self._slice(cached, want_start)
         if offline:
             return None
@@ -266,17 +270,27 @@ class DataFetcher:
     def _normalize_nav(df: pd.DataFrame) -> Optional[pd.DataFrame]:
         date_col = None
         nav_col = None
+        unit_nav_col = None
         for col in df.columns:
             if str(col) in ("日期", "净值日期"):
                 date_col = col
             if str(col) == "累计净值":
                 nav_col = col
+            if str(col) == "单位净值":
+                unit_nav_col = col
         if date_col is None or nav_col is None:
             return None
-        nav = df[[date_col, nav_col]].copy()
-        nav.columns = ["日期", "累计净值"]
+        cols = [date_col, nav_col]
+        names = ["日期", "累计净值"]
+        if unit_nav_col is not None:
+            cols.append(unit_nav_col)
+            names.append("单位净值")
+        nav = df[cols].copy()
+        nav.columns = names
         nav["日期"] = pd.to_datetime(nav["日期"])
         nav["累计净值"] = pd.to_numeric(nav["累计净值"], errors="coerce")
+        if "单位净值" in nav.columns:
+            nav["单位净值"] = pd.to_numeric(nav["单位净值"], errors="coerce")
         nav = (nav.dropna(subset=["日期", "累计净值"])
                .drop_duplicates(subset="日期", keep="last")
                .sort_values("日期")

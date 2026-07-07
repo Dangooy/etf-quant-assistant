@@ -8,6 +8,8 @@ from ..models import Market
 STALE_BLOCK_MESSAGE = "数据陈旧，本周仅供参考，禁止按此操作"
 INSUFFICIENT_CASH_REASON = "本周可用资金不足，待后续迁移回款后补足"
 EXECUTION_ORDER_NOTE = "执行顺序：先卖出后买入"
+QDII_CODES = {"513100", "513500"}
+QDII_UNKNOWN_PREMIUM_NOTE = "⚠ 买入前请在天天基金页面人工核对溢价"
 
 
 def generate_rebalance_plan(target_weights: Dict[str, float],
@@ -35,7 +37,10 @@ def generate_rebalance_plan(target_weights: Dict[str, float],
         }
 
     skipped = []
-    rebalance_trades = _rebalance_trades(target_weights, positions, total_assets, prices, params, skipped)
+    premium_status = allocation_result.get("premium_status", {})
+    rebalance_trades = _rebalance_trades(
+        target_weights, positions, total_assets, prices, params, skipped, premium_status
+    )
     migration_trades = _migration_trades(positions, total_assets, params)
     sell_trades = [t for t in rebalance_trades if t["action"] == "SELL"] + migration_trades
     buy_trades = [t for t in rebalance_trades if t["action"] == "BUY"]
@@ -58,7 +63,8 @@ def generate_rebalance_plan(target_weights: Dict[str, float],
 
 def _rebalance_trades(target_weights: Dict[str, float], positions: List[object],
                       total_assets: float, prices: Dict[str, float],
-                      params: dict, skipped: List[dict]) -> List[dict]:
+                      params: dict, skipped: List[dict],
+                      premium_status: Optional[dict] = None) -> List[dict]:
     if total_assets <= 0:
         return []
     trades = []
@@ -87,6 +93,15 @@ def _rebalance_trades(target_weights: Dict[str, float], positions: List[object],
         delta_value = desired_value - current_value
         action = "BUY" if delta_value > 0 else "SELL"
         amount = abs(delta_value)
+        premium = (premium_status or {}).get(code, {})
+        if action == "BUY" and _premium_blocks_buy(code, premium, params):
+            skipped.append({
+                "code": code,
+                "name": ETF_POOL.get(code, {}).get("name", ""),
+                "reason": (f"QDII 溢价 {premium['premium']:.2%} 超过 "
+                           f"{params['qdii_premium_limit']:.0%}，暂停买入"),
+            })
+            continue
         price = _price_for(code, pos, prices)
         if price is None or price <= 0:
             skipped.append({
@@ -108,6 +123,13 @@ def _rebalance_trades(target_weights: Dict[str, float], positions: List[object],
             })
             continue
 
+        reason = (f"实际权重 {current_weight:.2%} vs 目标 {target_weight:.2%}，"
+                  f"相对偏离 {relative_deviation:.1%} 超过再平衡带 {band:.0%}")
+        if action == "BUY" and code in QDII_CODES and premium.get("status") == "unknown":
+            reason += f"；{QDII_UNKNOWN_PREMIUM_NOTE}"
+        if action == "SELL" and _premium_deep_discount(code, premium, params):
+            reason += "；深折价卖出，若非断路器/迁移强制可考虑顺延"
+
         trades.append(_trade(
             code=code,
             name=ETF_POOL.get(code, {}).get("name", getattr(pos, "name", "")),
@@ -116,8 +138,7 @@ def _rebalance_trades(target_weights: Dict[str, float], positions: List[object],
             price=price,
             amount=amount,
             category="再平衡",
-            reason=(f"实际权重 {current_weight:.2%} vs 目标 {target_weight:.2%}，"
-                    f"相对偏离 {relative_deviation:.1%} 超过再平衡带 {band:.0%}"),
+            reason=reason,
             params=params,
         ))
 
@@ -237,6 +258,20 @@ def _buy_priority(code: str) -> int:
     if code == "518880":
         return 1
     return 2
+
+
+def _premium_blocks_buy(code: str, premium: dict, params: dict) -> bool:
+    return (
+        code in QDII_CODES and premium.get("premium") is not None
+        and float(premium["premium"]) > params["qdii_premium_limit"]
+    )
+
+
+def _premium_deep_discount(code: str, premium: dict, params: dict) -> bool:
+    return (
+        code in QDII_CODES and premium.get("premium") is not None
+        and float(premium["premium"]) < -params["qdii_premium_limit"]
+    )
 
 
 def _trade(code: str, name: str, action: str, shares: int, price: float,
