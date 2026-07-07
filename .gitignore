@@ -1,0 +1,24 @@
+# Python 构建产物
+__pycache__/
+*.pyc
+*.pyo
+
+# 临时备份目录（修复前快照，不入库）
+data/cache.bak_*/
+*.bak_*
+data/state.json
+
+# 系统杂项
+.DS_Store
+Thumbs.db
+.venv/
+
+# 运行态与个人数据（公开仓库永不提交）
+data/portfolio.json
+data/portfolio.json.bak
+data/*.corrupt-*
+data/state.json
+data/cache/*
+!data/cache/.gitkeep
+data/reports/*
+!data/reports/.gitkeep
