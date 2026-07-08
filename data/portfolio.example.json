@@ -1,5 +1,12 @@
 {
   "cash": 0.0,
+  "cash_flows": [
+    {
+      "date": "2026-01-01",
+      "amount": 0.0,
+      "note": "示例：正数为入金，负数为出金"
+    }
+  ],
   "positions": [
     {
       "code": "000001",
@@ -8,7 +15,7 @@
       "shares": 1000,
       "cost_price": 24.94,
       "current_price": 31.99,
-      "sector": "金融",
+      "sector": "信息技术",
       "last_updated": null,
       "pe": 0.0,
       "pb": 0.0,
@@ -17,12 +24,12 @@
     },
     {
       "code": "00700",
-      "name": "腾讯控股",
+      "name": "示例港股",
       "market": "港股",
       "shares": 500,
       "cost_price": 28.85,
       "current_price": 28.82,
-      "sector": "信息技术",
+      "sector": "医药",
       "last_updated": null,
       "pe": 0.0,
       "pb": 0.0,

@@ -52,7 +52,7 @@ class PortfolioBacktestEngineTest(unittest.TestCase):
         zero_idx = actions.index("risk_zero")
         self.assertIn("none", actions[zero_idx + 1:])
         zero_row = result.signals_log[zero_idx]
-        self.assertTrue(any("高点已重置至当前净值" in msg for msg in zero_row["warnings"]))
+        self.assertTrue(any("等待确认卖出执行后重置高点" in msg for msg in zero_row["warnings"]))
 
     def test_cash_yield_accrues_on_idle_cash(self):
         dates = pd.bdate_range(start="2024-01-01", end="2025-01-01")

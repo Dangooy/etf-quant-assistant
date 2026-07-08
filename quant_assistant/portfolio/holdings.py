@@ -23,6 +23,7 @@ class PortfolioManager:
     def __init__(self, data_file: Optional[Path] = None):
         self.data_file = data_file or DATA_DIR / "portfolio.json"
         self.cash = 0.0
+        self.cash_flows = []
         self.positions: List[StockPosition] = []
         self._load()
 
@@ -75,9 +76,14 @@ class PortfolioManager:
                 data = json.load(f)
             if isinstance(data, list):
                 self.cash = 0.0
+                self.cash_flows = []
                 position_data = data
             elif isinstance(data, dict):
                 self.cash = float(data.get("cash", 0.0))
+                cash_flows = data.get("cash_flows", [])
+                if not isinstance(cash_flows, list):
+                    raise ValueError("cash_flows 字段必须是出入金流水列表 (JSON array)")
+                self.cash_flows = cash_flows
                 position_data = data.get("positions")
                 if not isinstance(position_data, list):
                     raise ValueError("positions 字段必须是持仓列表 (JSON array)")
@@ -99,6 +105,7 @@ class PortfolioManager:
     def _save(self):
         data = {
             "cash": self.cash,
+            "cash_flows": self.cash_flows,
             "positions": [self._position_to_dict(p) for p in self.positions],
         }
         self.data_file.parent.mkdir(parents=True, exist_ok=True)
@@ -151,6 +158,18 @@ class PortfolioManager:
     @property
     def total_assets(self) -> float:
         return self.total_market_value + self.cash
+
+    @property
+    def cumulative_cash_flow(self) -> float:
+        total = 0.0
+        for flow in self.cash_flows:
+            if not isinstance(flow, dict):
+                continue
+            try:
+                total += float(flow.get("amount", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+        return total
 
     @property
     def total_cost(self) -> float:

@@ -6,6 +6,7 @@ from ..models import Market
 
 
 STALE_BLOCK_MESSAGE = "数据陈旧，本周仅供参考，禁止按此操作"
+MISSING_DATA_BLOCK_MESSAGE = "行情数据缺失（{codes}），禁止按此清单操作（含迁移清单）"
 INSUFFICIENT_CASH_REASON = "本周可用资金不足，待后续迁移回款后补足"
 EXECUTION_ORDER_NOTE = "执行顺序：先卖出后买入"
 QDII_CODES = {"513100", "513500"}
@@ -28,6 +29,18 @@ def generate_rebalance_plan(target_weights: Dict[str, float],
         return {
             "blocked": True,
             "message": STALE_BLOCK_MESSAGE,
+            "trades": [],
+            "skipped": [],
+            "migration_total": 0.0,
+            "total_assets": total_assets,
+            "available_cash_for_buys": float(cash or 0.0),
+            "execution_note": EXECUTION_ORDER_NOTE,
+        }
+    held_missing_codes = _held_missing_data_codes(allocation_result, positions)
+    if held_missing_codes:
+        return {
+            "blocked": True,
+            "message": MISSING_DATA_BLOCK_MESSAGE.format(codes="、".join(held_missing_codes)),
             "trades": [],
             "skipped": [],
             "migration_total": 0.0,
@@ -250,6 +263,14 @@ def _cash_skip_record(trade: dict) -> dict:
         "name": trade.get("name", ""),
         "reason": INSUFFICIENT_CASH_REASON,
     }
+
+
+def _held_missing_data_codes(allocation_result: dict, positions: List[object]) -> List[str]:
+    no_data_codes = set(allocation_result.get("signals", {}).get("no_data_codes", []))
+    if not no_data_codes:
+        return []
+    held_codes = {_code(pos) for pos in positions if _shares(pos) > 0}
+    return sorted(code for code in no_data_codes if code in held_codes)
 
 
 def _buy_priority(code: str) -> int:

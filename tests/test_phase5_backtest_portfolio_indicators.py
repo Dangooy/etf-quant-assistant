@@ -126,6 +126,18 @@ class Phase5PortfolioManagerTest(unittest.TestCase):
             self.assertEqual(pm.total_assets, 2500.0)
             self.assertAlmostEqual(pm.get_position_weight("510300"), 0.8)
 
+    def test_missing_cash_flows_field_loads_as_empty_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "portfolio.json"
+            path.write_text(json.dumps({
+                "cash": 500.0,
+                "positions": [position_dict(shares=1000, price=2.0)],
+            }), encoding="utf-8")
+            pm = PortfolioManager(path)
+
+            self.assertEqual(pm.cash_flows, [])
+            self.assertEqual(pm.cumulative_cash_flow, 0.0)
+
     def test_corrupt_portfolio_is_renamed_and_raises(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "portfolio.json"

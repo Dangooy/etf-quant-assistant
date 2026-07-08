@@ -12,6 +12,7 @@ from quant_assistant.allocation import compute_allocation
 from quant_assistant.config import ETF_POOL
 from quant_assistant.portfolio.holdings import PortfolioManager
 from quant_assistant.weekly import (
+    BREAKER_UNEXECUTED_WARNING,
     DAILY_CIRCUIT_WARNING,
     HEARTBEAT_NO_RECORD_NOTICE,
     HEARTBEAT_WARNING,
@@ -25,9 +26,10 @@ from quant_assistant.weekly import (
 )
 
 
-def write_portfolio(path, positions, cash=0.0):
+def write_portfolio(path, positions, cash=0.0, cash_flows=None):
     data = {
         "cash": cash,
+        "cash_flows": cash_flows or [],
         "positions": positions,
     }
     path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
@@ -59,6 +61,10 @@ def make_weekly_market_data(last_date):
             "最低": close,
         })
     return data
+
+
+def latest_prices(market_data):
+    return {code: float(df["收盘"].iloc[-1]) for code, df in market_data.items()}
 
 
 class Phase4WeeklyTest(unittest.TestCase):
@@ -252,7 +258,7 @@ class Phase4WeeklyTest(unittest.TestCase):
             self.assertEqual(result["message"], DAILY_CIRCUIT_WARNING)
             self.assertEqual(result["level"], "risk_zero")
 
-    def test_emergency_rebalance_zeroes_risk_legs_and_resets_high_water(self):
+    def test_emergency_rebalance_zeroes_risk_legs_and_sets_pending_reset(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             portfolio_path = root / "portfolio.json"
@@ -276,8 +282,10 @@ class Phase4WeeklyTest(unittest.TestCase):
             self.assertEqual(result["allocation"]["drawdown"]["action"], "risk_zero")
             self.assertEqual(result["trades"][0]["shares"], 1000)
             state = json.loads(state_path.read_text(encoding="utf-8"))
-            self.assertEqual(state["circuit_breaker_high_water"], 91500.0)
-            self.assertEqual(state["events"][-1]["type"], "circuit_breaker_reset_after_stop")
+            self.assertEqual(state["circuit_breaker_high_water"], 100000.0)
+            self.assertEqual(state["pending_breaker_reset"]["reset_to"], 91500.0)
+            self.assertEqual(state["events"], [])
+            self.assertIn("last_weekly_plan", state)
             self.assertTrue(result["report_path"].exists())
 
     def test_emergency_rebalance_halves_risk_legs(self):
@@ -303,6 +311,8 @@ class Phase4WeeklyTest(unittest.TestCase):
             self.assertTrue(result["triggered"])
             self.assertEqual(result["allocation"]["drawdown"]["action"], "risk_half")
             self.assertEqual(result["trades"][0]["shares"], 500)
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertNotIn("pending_breaker_reset", state)
 
     def test_emergency_rebalance_does_not_trigger_below_warn_level(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -327,7 +337,7 @@ class Phase4WeeklyTest(unittest.TestCase):
             self.assertFalse(result["triggered"])
             self.assertFalse(report_dir.exists())
 
-    def test_daily_emergency_state_prevents_weekly_duplicate_stop(self):
+    def test_emergency_pending_reset_applies_after_execution(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             portfolio_path = root / "portfolio.json"
@@ -347,14 +357,151 @@ class Phase4WeeklyTest(unittest.TestCase):
                 state_path=state_path,
                 report_dir=report_dir,
             )
-            state = json.loads(state_path.read_text(encoding="utf-8"))
-            weekly = compute_allocation(
-                make_weekly_market_data(datetime.date(2026, 7, 7)),
-                total_assets=91800.0,
-                state=state,
-                as_of_date=datetime.date(2026, 7, 7),
+            write_portfolio(portfolio_path, [], cash=91500.0)
+            pm_after_execution = PortfolioManager(portfolio_path)
+            result = generate_emergency_rebalance(
+                pm_after_execution,
+                as_of_date=datetime.date(2026, 7, 8),
+                state_path=state_path,
+                report_dir=report_dir,
             )
-            self.assertEqual(weekly["drawdown"]["action"], "none")
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertFalse(result["triggered"])
+            self.assertEqual(state["circuit_breaker_high_water"], 91500.0)
+            self.assertNotIn("pending_breaker_reset", state)
+            self.assertEqual(state["events"][-1]["type"], "circuit_breaker_reset_after_execution")
+
+    def test_weekly_pending_reset_stays_armed_when_stop_trade_not_executed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            portfolio_path = root / "portfolio.json"
+            state_path = root / "state.json"
+            report_dir = root / "reports"
+            write_portfolio(portfolio_path, [
+                position("510300", "沪深300ETF", 1000, 91.5),
+            ])
+            state_path.write_text(json.dumps({
+                "circuit_breaker_high_water": 100000.0,
+                "flow_total_seen": 0.0,
+                "pending_breaker_reset": {"date": "2026-07-07", "reset_to": 91500.0},
+                "last_weekly_plan": {
+                    "trades": [{
+                        "code": "510300",
+                        "name": "沪深300ETF",
+                        "action": "SELL",
+                        "shares": 1000,
+                        "price": 91.5,
+                        "reason": "断路器清零",
+                    }],
+                    "position_shares": {"510300": 1000},
+                },
+                "events": [],
+            }, ensure_ascii=False), encoding="utf-8")
+            pm = PortfolioManager(portfolio_path)
+            market_data = make_weekly_market_data(datetime.date(2026, 7, 8))
+            with patch("quant_assistant.weekly.load_etf_market_data", return_value=(
+                    market_data, latest_prices(market_data), [])), \
+                    patch("quant_assistant.weekly.compute_benchmark_snapshot", return_value={"available": False}):
+                result = generate_weekly_report(
+                    pm,
+                    as_of_date=datetime.date(2026, 7, 8),
+                    state_path=state_path,
+                    report_dir=report_dir,
+                )
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(result["allocation"]["drawdown"]["action"], "risk_zero")
+            self.assertIn(BREAKER_UNEXECUTED_WARNING, result["markdown"])
+            self.assertEqual(state["circuit_breaker_high_water"], 100000.0)
+            self.assertEqual(state["pending_breaker_reset"]["reset_to"], 91500.0)
+
+    def test_weekly_pending_reset_applies_after_stop_trade_execution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            portfolio_path = root / "portfolio.json"
+            state_path = root / "state.json"
+            report_dir = root / "reports"
+            write_portfolio(portfolio_path, [], cash=91500.0)
+            state_path.write_text(json.dumps({
+                "circuit_breaker_high_water": 100000.0,
+                "flow_total_seen": 0.0,
+                "pending_breaker_reset": {"date": "2026-07-07", "reset_to": 91500.0},
+                "last_weekly_plan": {
+                    "trades": [{
+                        "code": "510300",
+                        "name": "沪深300ETF",
+                        "action": "SELL",
+                        "shares": 1000,
+                        "price": 91.5,
+                        "reason": "断路器清零",
+                    }],
+                    "position_shares": {"510300": 1000},
+                },
+                "events": [],
+            }, ensure_ascii=False), encoding="utf-8")
+            pm = PortfolioManager(portfolio_path)
+            market_data = make_weekly_market_data(datetime.date(2026, 7, 8))
+            with patch("quant_assistant.weekly.load_etf_market_data", return_value=(
+                    market_data, latest_prices(market_data), [])), \
+                    patch("quant_assistant.weekly.compute_benchmark_snapshot", return_value={"available": False}):
+                result = generate_weekly_report(
+                    pm,
+                    as_of_date=datetime.date(2026, 7, 8),
+                    state_path=state_path,
+                    report_dir=report_dir,
+                )
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(result["allocation"]["drawdown"]["action"], "none")
+            self.assertEqual(state["circuit_breaker_high_water"], 91500.0)
+            self.assertNotIn("pending_breaker_reset", state)
+            self.assertEqual(state["events"][-1]["type"], "circuit_breaker_reset_after_execution")
+
+    def test_pending_reset_applies_cash_flow_delta_between_trigger_and_execution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            portfolio_path = root / "portfolio.json"
+            state_path = root / "state.json"
+            report_dir = root / "reports"
+            write_portfolio(
+                portfolio_path,
+                [],
+                cash=101500.0,
+                cash_flows=[{"date": "2026-07-08", "amount": 10000.0, "note": "入金"}],
+            )
+            state_path.write_text(json.dumps({
+                "circuit_breaker_high_water": 100000.0,
+                "flow_total_seen": 0.0,
+                "pending_breaker_reset": {"date": "2026-07-07", "reset_to": 91500.0},
+                "last_weekly_plan": {
+                    "trades": [{
+                        "code": "510300",
+                        "name": "沪深300ETF",
+                        "action": "SELL",
+                        "shares": 1000,
+                        "price": 91.5,
+                        "reason": "断路器清零",
+                    }],
+                    "position_shares": {"510300": 1000},
+                },
+                "events": [],
+            }, ensure_ascii=False), encoding="utf-8")
+            pm = PortfolioManager(portfolio_path)
+            market_data = make_weekly_market_data(datetime.date(2026, 7, 8))
+            with patch("quant_assistant.weekly.load_etf_market_data", return_value=(
+                    market_data, latest_prices(market_data), [])), \
+                    patch("quant_assistant.weekly.compute_benchmark_snapshot", return_value={"available": False}):
+                result = generate_weekly_report(
+                    pm,
+                    as_of_date=datetime.date(2026, 7, 8),
+                    state_path=state_path,
+                    report_dir=report_dir,
+                )
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(result["allocation"]["drawdown"]["action"], "none")
+            self.assertEqual(state["circuit_breaker_high_water"], 101500.0)
+            self.assertEqual(state["flow_total_seen"], 10000.0)
 
 
 if __name__ == "__main__":

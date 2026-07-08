@@ -115,6 +115,7 @@ class PortfolioBacktestEngine:
 
             if pending_trades is not None and pending_signal_date is not None and date > pending_signal_date:
                 cash = self._execute_trades(pending_trades, prices, shares, cash, date, trades)
+                state = self._apply_pending_breaker_reset(state, date)
                 pending_trades = None
                 pending_signal_date = None
 
@@ -378,6 +379,25 @@ class PortfolioBacktestEngine:
         if amount <= 0:
             return 0.0
         return max(amount * self.config.commission_rate, self.config.min_commission)
+
+    @staticmethod
+    def _apply_pending_breaker_reset(state: dict, date: datetime.date) -> dict:
+        pending = state.get("pending_breaker_reset") if isinstance(state, dict) else None
+        if not isinstance(pending, dict):
+            return state
+        updated = dict(state)
+        reset_to = float(pending.get("reset_to", 0.0) or 0.0)
+        updated["circuit_breaker_high_water"] = reset_to
+        updated.pop("pending_breaker_reset", None)
+        events = list(updated.get("events") or [])
+        events.append({
+            "date": date.isoformat(),
+            "type": "circuit_breaker_reset_after_execution",
+            "message": "断路器清零卖出已确认执行，高点已重置",
+            "reset_to": reset_to,
+        })
+        updated["events"] = events
+        return updated
 
     def _metrics(self, equity_curve: List[dict]) -> dict:
         if not equity_curve:

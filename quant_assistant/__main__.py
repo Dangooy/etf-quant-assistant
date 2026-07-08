@@ -2,7 +2,7 @@
 统一命令行入口。四条固定命令，任何模型/任何人照 CLAUDE.md 执行即可：
 
   python -m quant_assistant daily                 # 每日管道：行情→持仓→指标→风控→仪表盘
-  python -m quant_assistant backtest 000938       # 回测（--strategy --days 可选）
+  python -m quant_assistant backtest 600519       # 回测（--strategy --days 可选）
   python -m quant_assistant screen                # 多因子选股筛选
   python -m quant_assistant dashboard             # 仅生成仪表盘（离线可用）
 """

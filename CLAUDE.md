@@ -12,7 +12,7 @@ cd ~/projects/quant-assistant
 python3 -m quant_assistant daily
 
 # 2. 回测：策略 dual_ma / macd / rsi / kdj / composite
-python3 -m quant_assistant backtest 000938 --strategy dual_ma --days 365 --no-open
+python3 -m quant_assistant backtest 600519 --strategy dual_ma --days 365 --no-open
 
 # 3. 选股筛选（候选池在 quant_assistant/screening/universe.py 手工维护）
 python3 -m quant_assistant screen

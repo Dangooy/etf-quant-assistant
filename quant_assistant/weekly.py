@@ -21,6 +21,8 @@ HEARTBEAT_NO_RECORD_NOTICE = "尚无周报运行记录（首次运行或 launchd
 DAILY_CIRCUIT_WARNING = "断路器触发，运行 weekly 获取减仓清单"
 EMERGENCY_REPORT_PREFIX = "emergency"
 EMERGENCY_EXECUTION_NOTE = "应急清单只卖出风险腿，不做买入再平衡；买入归周度清单处理。"
+BREAKER_UNEXECUTED_WARNING = "上周断路器清单未执行，断路器保持触发状态"
+BREAKER_RESET_APPLIED_MESSAGE = "断路器清零卖出已确认执行，高点已重置"
 
 
 def load_state(path: Path = STATE_PATH) -> Optional[dict]:
@@ -48,6 +50,8 @@ def save_state(path: Path, original_state: Optional[dict], updates: dict) -> dic
                 events = []
             events.extend(value or [])
             state["events"] = events
+        elif value is None:
+            state.pop(key, None)
         else:
             state[key] = value
 
@@ -80,23 +84,29 @@ def generate_weekly_report(pm: PortfolioManager,
     market_data, prices, cache_warnings = load_etf_market_data()
     original_state = load_state(state_path)
     heartbeat = weekly_heartbeat_warning(original_state, datetime.datetime.combine(as_of_date, datetime.time(16, 30)))
+    execution_check = check_previous_plan_execution(
+        original_state.get("last_weekly_plan") if isinstance(original_state, dict) else None,
+        pm,
+    )
+    state_for_allocation, pending_warning, pending_events, clear_pending = _resolve_pending_breaker_reset(
+        original_state, execution_check, as_of_date, pm.cumulative_cash_flow
+    )
 
     allocation = compute_allocation(
         market_data=market_data,
         total_assets=pm.total_assets,
-        state=original_state,
+        state=state_for_allocation,
         as_of_date=as_of_date,
+        cumulative_cash_flow=pm.cumulative_cash_flow,
     )
+    if pending_warning:
+        allocation["warnings"].append(pending_warning)
     plan = generate_rebalance_plan(
         target_weights=allocation["target_weights"],
         positions=pm.positions,
         cash=pm.cash,
         prices=prices,
         allocation_result=allocation,
-    )
-    execution_check = check_previous_plan_execution(
-        original_state.get("last_weekly_plan") if isinstance(original_state, dict) else None,
-        pm,
     )
     benchmark = compute_benchmark_snapshot(as_of_date)
     migration = migration_progress(plan, pm, original_state)
@@ -118,6 +128,12 @@ def generate_weekly_report(pm: PortfolioManager,
         f.write(markdown)
 
     state_updates = dict(allocation["state_updates"])
+    if pending_events:
+        state_updates.setdefault("events", []).extend(pending_events)
+    if clear_pending and "pending_breaker_reset" not in state_updates:
+        state_updates["pending_breaker_reset"] = None
+    elif pending_warning and isinstance(original_state, dict):
+        state_updates["pending_breaker_reset"] = original_state.get("pending_breaker_reset")
     state_updates["last_weekly_run"] = datetime.datetime.now().isoformat(timespec="seconds")
     state_updates["last_weekly_report"] = str(report_path)
     state_updates["last_weekly_plan"] = _state_plan_snapshot(plan, pm, as_of_date)
@@ -224,21 +240,40 @@ def generate_emergency_rebalance(pm: PortfolioManager,
     as_of_date = as_of_date or datetime.date.today()
     params = params or STRATEGY_PARAMS
     original_state = load_state(state_path)
+    execution_check = check_previous_plan_execution(
+        original_state.get("last_weekly_plan") if isinstance(original_state, dict) else None,
+        pm,
+    )
+    state_for_allocation, pending_warning, pending_events, clear_pending = _resolve_pending_breaker_reset(
+        original_state, execution_check, as_of_date, pm.cumulative_cash_flow
+    )
     allocation = compute_allocation(
         market_data={},
         total_assets=pm.total_assets,
-        state=original_state,
+        state=state_for_allocation,
         as_of_date=as_of_date,
         params=params,
+        cumulative_cash_flow=pm.cumulative_cash_flow,
     )
+    if pending_warning:
+        allocation["warnings"].append(pending_warning)
     action = allocation["drawdown"]["action"]
     if action not in ("risk_half", "risk_zero"):
+        if pending_events or clear_pending:
+            state_updates = dict(allocation["state_updates"])
+            if pending_events:
+                state_updates.setdefault("events", []).extend(pending_events)
+            if clear_pending and "pending_breaker_reset" not in state_updates:
+                state_updates["pending_breaker_reset"] = None
+            new_state = save_state(state_path, original_state, state_updates)
+        else:
+            new_state = original_state
         return {
             "triggered": False,
             "allocation": allocation,
             "trades": [],
             "report_path": None,
-            "state": original_state,
+            "state": new_state,
         }
 
     factor = 0.5 if action == "risk_half" else 0.0
@@ -248,7 +283,15 @@ def generate_emergency_rebalance(pm: PortfolioManager,
     report_dir.mkdir(parents=True, exist_ok=True)
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(markdown)
-    new_state = save_state(state_path, original_state, allocation["state_updates"])
+    state_updates = dict(allocation["state_updates"])
+    if pending_events:
+        state_updates.setdefault("events", []).extend(pending_events)
+    if clear_pending and "pending_breaker_reset" not in state_updates:
+        state_updates["pending_breaker_reset"] = None
+    elif pending_warning and isinstance(original_state, dict):
+        state_updates["pending_breaker_reset"] = original_state.get("pending_breaker_reset")
+    state_updates["last_weekly_plan"] = _state_plan_snapshot({"trades": trades}, pm, as_of_date)
+    new_state = save_state(state_path, original_state, state_updates)
     return {
         "triggered": True,
         "allocation": allocation,
@@ -399,6 +442,37 @@ def check_previous_plan_execution(previous_plan: Optional[dict],
         "unexecuted": unexecuted,
         "max_deviation": max_deviation,
     }
+
+
+def _resolve_pending_breaker_reset(original_state: Optional[dict],
+                                   execution_check: dict,
+                                   as_of_date: datetime.date,
+                                   cumulative_cash_flow: float) -> Tuple[Optional[dict], Optional[str], List[dict], bool]:
+    if not isinstance(original_state, dict):
+        return original_state, None, [], False
+    pending = original_state.get("pending_breaker_reset")
+    if not isinstance(pending, dict):
+        return original_state, None, [], False
+    checked = bool(execution_check.get("checked"))
+    unexecuted = execution_check.get("unexecuted") or []
+    if not checked or unexecuted:
+        return original_state, BREAKER_UNEXECUTED_WARNING, [], False
+
+    reset_to = float(pending.get("reset_to", 0.0) or 0.0)
+    previous_flow_total = float(original_state.get("flow_total_seen", 0.0) or 0.0)
+    current_flow_total = float(cumulative_cash_flow or 0.0)
+    adjusted_reset_to = max(0.0, reset_to + current_flow_total - previous_flow_total)
+    state_for_allocation = dict(original_state)
+    state_for_allocation["circuit_breaker_high_water"] = adjusted_reset_to
+    state_for_allocation["flow_total_seen"] = current_flow_total
+    state_for_allocation.pop("pending_breaker_reset", None)
+    event = {
+        "date": as_of_date.isoformat(),
+        "type": "circuit_breaker_reset_after_execution",
+        "message": BREAKER_RESET_APPLIED_MESSAGE,
+        "reset_to": adjusted_reset_to,
+    }
+    return state_for_allocation, None, [event], True
 
 
 def migration_progress(plan: dict, pm: PortfolioManager, state: Optional[dict]) -> dict:

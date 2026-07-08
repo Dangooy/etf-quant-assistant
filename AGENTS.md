@@ -1,6 +1,6 @@
 # 给实施代理（Codex 等）的项目约定
 
-本项目的完整操作手册在 [CLAUDE.md](CLAUDE.md)，需求与架构设计在 [docs/DESIGN-etf-weekly.md](docs/DESIGN-etf-weekly.md)，分期实施提示词在 [docs/PROMPTS-etf-weekly.md](docs/PROMPTS-etf-weekly.md)。开工前必须全部读完。
+本项目的完整操作手册在 [CLAUDE.md](CLAUDE.md)，需求与架构设计在 [docs/DESIGN-etf-weekly.md](docs/DESIGN-etf-weekly.md)，策略不变量在 [docs/INVARIANTS.md](docs/INVARIANTS.md)。开工前必须全部读完。
 
 ## 硬性约束（违反任何一条 = 验收不通过）
 
@@ -10,8 +10,9 @@
 4. 运行与自测一律用项目内 `.venv/bin/python`，不改系统环境。
 5. 现有 CLI 命令（daily / backtest / screen / dashboard）在任何阶段都必须保持可用。
 6. 交易清单只能由规则生成，定性内容只能进报告附注区。
-7. 严格按 docs/PROMPTS-etf-weekly.md 一次只做一个 Phase：完成后 git commit（信息前缀 "PhaseN: "），输出变更文件清单和逐条自测结果，然后停下等待人工验收，不许自行开始下一期。
+7. 大改动分期进行：每期完成后 git commit、输出变更清单和自测结果，等待人工验收后再继续。
 8. 禁止为凑回测指标做参数搜索或修改规则；回测不达标就如实报告。
+9. pytest 不全绿 = 验收不通过。
 
 ## 环境
 

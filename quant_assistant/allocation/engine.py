@@ -10,6 +10,7 @@ from ..data.fetcher import resample_weekly
 
 STATE_RESET_WARNING = "断路器高点已丢失重置，请人工核对"
 STOP_RESET_MESSAGE = "断路器清零触发，高点已重置至当前净值，后续按趋势规则重建"
+STOP_PENDING_MESSAGE = "断路器清零触发，等待确认卖出执行后重置高点"
 
 A_SHARE_LEG = ["510300", "512890", "510500"]
 OVERSEAS_LEG = ["513100", "513500"]
@@ -25,7 +26,8 @@ def compute_allocation(market_data: Dict[str, pd.DataFrame],
                        state: Optional[dict] = None,
                        as_of_date: Optional[datetime.date] = None,
                        params: Optional[dict] = None,
-                       target_weights: Optional[dict] = None) -> dict:
+                       target_weights: Optional[dict] = None,
+                       cumulative_cash_flow: float = 0.0) -> dict:
     """计算 ETF 目标权重。
 
     这是纯计算入口：不联网、不读写文件。state 缺失/损坏由调用方用
@@ -35,7 +37,7 @@ def compute_allocation(market_data: Dict[str, pd.DataFrame],
     target_weights = target_weights or TARGET_WEIGHTS
     as_of_date = as_of_date or datetime.date.today()
     recent_day = _last_completed_trading_day(as_of_date)
-    state_info = _prepare_state(state, total_assets, as_of_date)
+    state_info = _prepare_state(state, total_assets, as_of_date, cumulative_cash_flow)
 
     warnings = list(state_info["warnings"])
     trend_status = {}
@@ -49,7 +51,7 @@ def compute_allocation(market_data: Dict[str, pd.DataFrame],
             trend_status[code] = _trend_record(code, "无数据", None, None, None)
             no_data_codes.append(code)
             if code in QDII_CODES:
-                premium_status[code] = _premium_record(code, None, params)
+                premium_status[code] = _premium_record(code, None, params, recent_day)
             continue
 
         last_date = _last_date(df)
@@ -65,7 +67,7 @@ def compute_allocation(market_data: Dict[str, pd.DataFrame],
         )
         trend_status[code] = _trend_record(code, status, close, ma_value, last_date)
         if code in QDII_CODES:
-            premium_status[code] = _premium_record(code, df, params)
+            premium_status[code] = _premium_record(code, df, params, recent_day)
             if premium_status[code]["status"] == "unknown":
                 warnings.append(f"{code} {ETF_POOL[code]['name']} QDII 溢价未知，买入前请人工核对")
 
@@ -102,14 +104,11 @@ def compute_allocation(market_data: Dict[str, pd.DataFrame],
             weights[code] = new_weight
         weights[SHORT_BOND_CODE] += released
         if drawdown["action"] == "risk_zero":
-            warnings.append(STOP_RESET_MESSAGE)
-            state_info["state_updates"]["circuit_breaker_high_water"] = float(total_assets or 0.0)
-            state_info["state_updates"]["events"].append({
+            warnings.append(STOP_PENDING_MESSAGE)
+            state_info["state_updates"]["pending_breaker_reset"] = {
                 "date": as_of_date.isoformat(),
-                "type": "circuit_breaker_reset_after_stop",
-                "message": STOP_RESET_MESSAGE,
                 "reset_to": float(total_assets or 0.0),
-            })
+            }
 
     weights = _round_weights(weights)
 
@@ -135,12 +134,16 @@ def compute_allocation(market_data: Dict[str, pd.DataFrame],
 
 
 def _prepare_state(state: Optional[dict], total_assets: float,
-                   as_of_date: datetime.date) -> dict:
+                   as_of_date: datetime.date,
+                   cumulative_cash_flow: float = 0.0) -> dict:
     warnings = []
     updates = {"events": []}
     state_dict = copy.deepcopy(state) if isinstance(state, dict) else {}
     invalid = state is None or bool(state_dict.get("_state_invalid"))
     high_water = state_dict.get("circuit_breaker_high_water")
+    current_flow_total = float(cumulative_cash_flow or 0.0)
+    flow_total_seen = state_dict.get("flow_total_seen")
+    has_flow_baseline = isinstance(state, dict) and "flow_total_seen" in state_dict
 
     try:
         high_water = float(high_water)
@@ -151,6 +154,15 @@ def _prepare_state(state: Optional[dict], total_assets: float,
     if high_water is None or high_water <= 0:
         invalid = True
 
+    if not invalid and has_flow_baseline:
+        try:
+            previous_flow_total = float(flow_total_seen)
+        except (TypeError, ValueError):
+            previous_flow_total = current_flow_total
+        high_water += current_flow_total - previous_flow_total
+        if high_water <= 0:
+            invalid = True
+
     if invalid:
         warnings.append(STATE_RESET_WARNING)
         high_water = max(float(total_assets or 0.0), 0.0)
@@ -160,10 +172,11 @@ def _prepare_state(state: Optional[dict], total_assets: float,
             "message": STATE_RESET_WARNING,
             "reset_to": high_water,
         })
-    elif total_assets > high_water:
+    elif (has_flow_baseline or current_flow_total == 0.0) and total_assets > high_water:
         high_water = float(total_assets)
 
     updates["circuit_breaker_high_water"] = high_water
+    updates["flow_total_seen"] = current_flow_total
     return {
         "high_water": high_water,
         "warnings": warnings,
@@ -176,6 +189,18 @@ def _last_completed_trading_day(as_of_date: datetime.date) -> datetime.date:
     while d.weekday() >= 5:
         d -= datetime.timedelta(days=1)
     return d
+
+
+def _business_days_between(start_date: datetime.date, end_date: datetime.date) -> int:
+    if start_date >= end_date:
+        return 0
+    days = 0
+    current = start_date
+    while current < end_date:
+        current += datetime.timedelta(days=1)
+        if current.weekday() < 5:
+            days += 1
+    return days
 
 
 def _clean_frame(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
@@ -311,7 +336,8 @@ def _momentum_return(df: Optional[pd.DataFrame], window_weeks: int) -> Optional[
     return latest / base - 1.0
 
 
-def _premium_record(code: str, df: Optional[pd.DataFrame], params: dict) -> dict:
+def _premium_record(code: str, df: Optional[pd.DataFrame],
+                    params: dict, as_of_date: datetime.date) -> dict:
     record = {
         "code": code,
         "name": ETF_POOL.get(code, {}).get("name", ""),
@@ -324,20 +350,17 @@ def _premium_record(code: str, df: Optional[pd.DataFrame], params: dict) -> dict
     clean = _clean_frame(df)
     if clean is None or clean.empty or "单位净值" not in clean.columns:
         return record
-    price_rows = clean.dropna(subset=["收盘"])
-    nav_rows = clean.dropna(subset=["单位净值"])
-    if price_rows.empty or nav_rows.empty:
+    common_rows = clean.dropna(subset=["收盘", "单位净值"])
+    if common_rows.empty:
         return record
-    price_row = price_rows.iloc[-1]
-    nav_row = nav_rows.iloc[-1]
-    price_date = pd.to_datetime(price_row["日期"]).date()
-    nav_date = pd.to_datetime(nav_row["日期"]).date()
-    record["price_date"] = price_date.isoformat()
-    record["nav_date"] = nav_date.isoformat()
-    if price_date != nav_date:
+    common_row = common_rows.iloc[-1]
+    common_date = pd.to_datetime(common_row["日期"]).date()
+    record["price_date"] = common_date.isoformat()
+    record["nav_date"] = common_date.isoformat()
+    if _business_days_between(common_date, as_of_date) > 3:
         return record
-    unit_nav = float(nav_row["单位净值"])
-    price = float(price_row["收盘"])
+    unit_nav = float(common_row["单位净值"])
+    price = float(common_row["收盘"])
     if unit_nav <= 0:
         return record
     premium = price / unit_nav - 1.0
